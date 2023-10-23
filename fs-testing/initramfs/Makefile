@@ -5,12 +5,19 @@ INITRAMFS_DEPS := \
 	../../vinter_python/hypercall \
 	../fs-dump/target/x86_64-unknown-linux-musl/release/fs-dump
 
-default: initramfs.cpio.gz initramfs_pmfs.cpio.gz
+default: initramfs.cpio.gz initramfs_pmfs.cpio.gz initramfs_winefs.cpio.gz
 .PHONY: default
 
 initramfs.cpio.gz: $(INITRAMFS_DEPS)
 	./create-initramfs.sh > $@
-	
+
+initramfs_winefs.cpio.gz: $(INITRAMFS_DEPS)
+	rm -rf initramfs_winefs
+	mkdir -p initramfs_winefs/{bin,lib}
+	ln -s lib initramfs_winefs/lib64
+	./copy-binary.sh hwclock initramfs_winefs
+	./create-initramfs.sh initramfs_winefs > $@
+
 # Newer busybox does not work with the old PMFS kernel.
 initramfs_pmfs.cpio.gz: $(INITRAMFS_DEPS) busybox_pmfs
 	BUSYBOX=./busybox_pmfs ./create-initramfs.sh > $@

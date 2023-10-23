@@ -219,6 +219,7 @@ const MAX_UNPERSISTED_SUBSETS_LOG2: usize = 4;
 /// writes to the same line. Note that the maximum number of generated crash images at one fence is
 /// thus `MAX_UNPERSISTED_SUBSETS * MAX_PARTIAL_FLUSHES_COUNT`.
 const MAX_PARTIAL_FLUSHES_COUNT: usize = 20;
+const MAX_STATES_PER_RANDOM_LINES: usize = 100;
 /// Use heuristic based on read lines or consider all stores?
 const USE_HEURISTIC: bool = true;
 
@@ -600,6 +601,7 @@ impl HeuristicCrashImageGenerator {
                         .collect();
                     for partial_write_indices in
                         line_partial_writes.iter().multi_cartesian_product()
+                        .take(MAX_STATES_PER_RANDOM_LINES)
                     {
                         let mut subset_persisted_mem = mem.try_clone()?;
                         for (line_number, flush_writes_limit) in random_lines
@@ -694,7 +696,7 @@ impl HeuristicCrashImageGenerator {
             &self.output_dir,
             self.vm_config.vm.pmem_len.try_into().unwrap(),
         )?;
-        let mem = X86PersistentMemory::new(image, LineGranularity::Word)?;
+        let mem = X86PersistentMemory::new(image, LineGranularity::Cacheline)?;
         let mut replayer = MemoryReplayer::new(mem);
 
         // grab a reference to the memory so that we can access it while processing the trace
