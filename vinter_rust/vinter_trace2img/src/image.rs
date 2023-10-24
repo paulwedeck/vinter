@@ -42,16 +42,27 @@ pub struct MemoryImageMmap {
 impl MemoryImageMmap {
     /// Create a new image in the given directory. The directory should be in a file system that
     /// supports reflinks. Later calls to `persist()` should be in the same file system.
-    pub fn new_in<P: AsRef<Path>>(dir: P, len: usize) -> Result<Self> {
+    pub fn new_from_orig<P: AsRef<Path>>(dir: P, len: usize, orig : Option<File>) -> Result<Self> {
         let mut tmpfile =
             NamedTempFile::new_in(dir).context("creating temporary file for PMEM image failed")?;
-        // unwrap: usize should always fit into u64
-        tmpfile.as_file_mut().set_len(len.try_into().unwrap())?;
+        if orig.is_some() {
+            let file = orig.unwrap();
+            reflink_or_copy(&file, tmpfile.as_file_mut())?;
+            if (tmpfile.as_file_mut().metadata().unwrap().len() as usize) != len {
+                return Err(anyhow::anyhow!("File orig had wrong length (!= {})!", len));
+            }
+        } else {
+            // unwrap: usize should always fit into u64
+            tmpfile.as_file_mut().set_len(len.try_into().unwrap())?;
+        }
         // safety: we create a shared mapping to a temporay file, so we will always hold the only
         // reference.
         let mapping = unsafe { MmapOptions::new().populate().map_mut(&tmpfile)? };
 
         Ok(MemoryImageMmap { tmpfile, mapping })
+    }
+    pub fn new_in<P: AsRef<Path>>(dir: P, len: usize) -> Result<Self> {
+        return Self::new_from_orig::<P>(dir, len, None);
     }
 }
 

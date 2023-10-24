@@ -11,10 +11,11 @@ default: initramfs.cpio.gz initramfs_pmfs.cpio.gz initramfs_winefs.cpio.gz
 initramfs.cpio.gz: $(INITRAMFS_DEPS)
 	./create-initramfs.sh > $@
 
-initramfs_winefs.cpio.gz: $(INITRAMFS_DEPS)
+initramfs_winefs.cpio.gz: $(INITRAMFS_DEPS) gcov_gather_on_test.sh
 	rm -rf initramfs_winefs
 	mkdir -p initramfs_winefs/{bin,lib}
 	ln -s lib initramfs_winefs/lib64
+	cp -a gcov_gather_on_test.sh initramfs_winefs/bin
 	./copy-binary.sh hwclock initramfs_winefs
 	./create-initramfs.sh initramfs_winefs > $@
 

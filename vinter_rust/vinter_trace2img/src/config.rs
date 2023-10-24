@@ -16,6 +16,7 @@ pub struct VM {
     pub qemu_args: Vec<String>,
     /// path to Linux kernel System.map file
     pub system_map: String,
+    pub load_pmem : Option<String>,
 }
 
 /// Format of the VM configuration file.
@@ -31,4 +32,5 @@ pub struct Test {
     pub trace_cmd_suffix: String,
     pub checkpoint_range: Option<(isize, isize)>,
     pub dump_cmd_suffix: String,
+    pub load_pmem : Option<String>,
 }

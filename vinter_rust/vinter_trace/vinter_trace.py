@@ -13,7 +13,7 @@ from typing import Any, Callable, ContextManager, Dict, IO, List, Optional
 import pandare  # type: ignore
 
 class PersistentMemoryTracer(ContextManager):
-    def __init__(self, vm, *, qcow=None):
+    def __init__(self, vm, *, qcow=None, disk=None):
         self.vm = vm
 
         if not qcow:
@@ -28,6 +28,11 @@ class PersistentMemoryTracer(ContextManager):
                 return str(vm['basepath'] / p)
             return path
 
+        disk_arg = []
+        if disk:
+            disk_arg = ['-drive', 'format=raw,file=' + disk + ',id=x0,if=none',
+                        '-device', 'virtio-blk-pci,drive=x0,bus=pci.0']
+
         print('Initializing Panda', flush=True)
         self.panda = pandare.Panda(arch='x86_64',
                                    mem=vm['mem'],
@@ -38,7 +43,10 @@ class PersistentMemoryTracer(ContextManager):
                                        *(vm['qemu_args'] or []),
                                        '-kernel', relative_path(vm['kernel']),
                                        '-initrd', relative_path(vm['initrd']),
-                                       '-display', 'none'
+                                       '-display', 'none',
+                                       *(disk_arg),
+# 1970 becomes 2070 ???
+                                       '-rtc', 'base=2000-01-01,clock=host',
                                    ],
                                   )
 
@@ -152,6 +160,7 @@ def main() -> int:
     arg_parser.add_argument('--qcow', type=str, help='attach the given disk (also used for snapshots)')
     arg_parser.add_argument('--interact', action='store_true', help='interact with serial console for debugging')
     arg_parser.add_argument('--cmd', type=str, help='run a command from the config file')
+    arg_parser.add_argument('--disk', type=str, help='provide this file as a raw disk to the vm')
     arg_parser.add_argument('--run', type=str, help='run an arbitrary command')
     arg_parser.add_argument('--cmd-output', type=argparse.FileType('wb'), help='output file for --cmd or --run output')
     arg_parser.add_argument('--save-snapshot', type=str, help='create a snapshot after running commands')
@@ -167,7 +176,7 @@ def main() -> int:
     config = yaml.safe_load(args.config)
     config['vm']['basepath'] = Path(args.config.name).parent
 
-    with PersistentMemoryTracer(config['vm'], qcow=args.qcow) as tracer:
+    with PersistentMemoryTracer(config['vm'], qcow=args.qcow, disk=args.disk) as tracer:
         if args.load_snapshot:
             print(f"Loading snapshot {args.load_snapshot}")
             tracer.load_snapshot(args.load_snapshot)

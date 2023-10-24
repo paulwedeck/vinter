@@ -3,11 +3,14 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use tempdir::TempDir;
 
-use threadpool::ThreadPool;
+use tokio::sync::Semaphore;
+use futures_executor::ThreadPool;
+use std::sync::Arc;
 
 use std::sync::mpsc::channel;
 
@@ -226,12 +229,16 @@ const MAX_PARTIAL_FLUSHES_COUNT: usize = 20;
 const MAX_STATES_PER_RANDOM_LINES: usize = 100;
 /// Use heuristic based on read lines or consider all stores?
 const USE_HEURISTIC: bool = true;
+const COVEXT_DRIVE_SIZE :u64 = 16777216; // 16MB
+const COVEXT_CMD : &str = "(mount -t debugfs none /sys/kernel/debug; /bin/gcov_gather_on_test.sh /dev/vda)";
+const GCOV_TOOL : &str = "gcov-tool-9.5";
 
 pub struct HeuristicCrashImageGenerator {
     vm_config_path: PathBuf,
     vm_config: config::Config,
     test_config: config::Test,
     output_dir: PathBuf,
+    cov_dir : Option<PathBuf>,
     log: File,
     rng: fastrand::Rng,
     /// Generated crash images, indexed by their hash.
@@ -245,6 +252,7 @@ impl HeuristicCrashImageGenerator {
         vm_config_path: PathBuf,
         test_config_path: PathBuf,
         mut output_dir: PathBuf,
+        cov_dir : Option<PathBuf>,
     ) -> Result<Self> {
         let vm_config: config::Config = {
             let f = File::open(&vm_config_path).context("could not open VM config file")?;
@@ -287,6 +295,10 @@ impl HeuristicCrashImageGenerator {
             .context("could not create semantic_states directory")?;
         let log = File::create(output_dir.join("trace2img.log"))
             .context("could not create trace2img.log")?;
+
+        std::fs::create_dir(output_dir.join("gcov"))
+            .context("could not create gcov directory")?;
+
         // create a base image for snapshots
         let status = Command::new("qemu-img")
             .args(["create", "-f", "qcow2"])
@@ -303,6 +315,7 @@ impl HeuristicCrashImageGenerator {
             vm_config,
             test_config,
             output_dir,
+            cov_dir,
             log,
             rng: fastrand::Rng::with_seed(1633634632),
             crash_images: HashMap::new(),
@@ -310,20 +323,81 @@ impl HeuristicCrashImageGenerator {
         })
     }
 
+    pub fn pmem_file(&self) -> Option<&str> {
+      match &self.test_config.load_pmem {
+        None => self.vm_config.vm.load_pmem.as_deref(),
+        Some(file) => Some(file)
+      }
+    }
+
+    pub fn create_covext_cmd(&self) -> Result<(Option<TempDir>, &str)> {
+      if self.cov_dir.is_none() {
+        return Ok((None, ""));
+      }
+
+      let tmp_dir = TempDir::new("vinter-gcov")?;
+
+      let drive_file = File::create(Self::covext_drive(&tmp_dir))?;
+      drive_file.set_len(COVEXT_DRIVE_SIZE)?;
+
+      Ok((Some(tmp_dir), COVEXT_CMD))
+    }
+
+    pub fn covext_drive(tmp_dir : &TempDir) -> PathBuf {
+      tmp_dir.path().join("drive.tar")
+    }
+
+    pub fn finish_covext(&self, tmp_dir : Option<TempDir>) -> Result<()> {
+      match tmp_dir {
+        None => Ok(()),
+        Some(dir) => {
+          let status = Command::new("tar")
+            .current_dir(&dir)
+            .arg("xf")
+            .arg(Self::covext_drive(&dir))
+            .status()?;
+          if !status.success() {
+            bail!("failed to extract gcov tar with status {}\n", status);
+          }
+
+          std::fs::remove_file(Self::covext_drive(&dir))?;
+
+          merge_cov(&self.output_dir.join("gcov"), (&dir).path())?;
+
+          Ok(())
+        }
+      }
+    }
+
     /// Start a VM and trace test execution.
     pub fn trace_pre_failure(&self) -> Result<()> {
-        let cmd = format!("cat /proc/uptime; cat /proc/uptime; cat /proc/uptime; {prefix} && {suffix} && hypercall success; cat /proc/uptime",
+        let (covext_dir, covext_cmd) = self.create_covext_cmd()?;
+
+        let cmd = format!("cat /proc/uptime; cat /proc/uptime; cat /proc/uptime; {prefix} && {suffix} && hypercall success; cat /proc/uptime; {covext}",
             prefix = self.vm_config.commands.get("trace_cmd_prefix").ok_or_else(|| anyhow!("missing trace_cmd_prefix in VM configuration"))?,
-            suffix = self.test_config.trace_cmd_suffix);
-        let status = trace_command()?
-            .arg("--qcow")
+            suffix = self.test_config.trace_cmd_suffix,
+            covext = covext_cmd);
+
+        let mut procbuild = trace_command()?;
+        procbuild.arg("--qcow")
             .arg(self.output_dir.join("img.qcow2"))
             .arg("--trace")
             .arg(self.trace_path())
             .args(["--trace-what", "write,fence,flush,hypercall"])
             .arg("--run")
-            .arg(cmd)
-            .arg("--save-pmem")
+            .arg(cmd);
+
+        if let Some(dir) = &covext_dir  {
+            procbuild.arg("--disk")
+                .arg(Self::covext_drive(&dir));
+        }
+
+        if let Some(file) = self.pmem_file() {
+            procbuild.arg("--load-pmem")
+                .arg(&file);
+        }
+
+        let status = procbuild.arg("--save-pmem")
             .arg(self.output_dir.join("final.img"))
             .arg(&self.vm_config_path)
             .stderr(self.log.try_clone()?)
@@ -332,35 +406,50 @@ impl HeuristicCrashImageGenerator {
         if !status.success() {
             bail!("pre-failure tracing failed with status {}", status);
         }
+
+        self.finish_covext(covext_dir)?;
         Ok(())
     }
 
     /// Trace recovery of a crash image, for use in the cross-failure heuristic.
     pub fn trace_recovery(&self, crash_img_hash: &CrashImageHash) -> Result<PathBuf> {
+        let (covext_dir, covext_cmd) = self.create_covext_cmd()?;
+
         let cmd = self
             .vm_config
             .commands
             .get("recovery_cmd")
             .ok_or_else(|| anyhow!("missing recovery_cmd in VM configuration"))?;
+        let full_cmd = format!("{}; {}", cmd, covext_cmd);
         let path = self.recovery_trace_path(crash_img_hash);
-        let status = trace_command()?
-            .arg("--qcow")
+        let mut procbuild = trace_command()?;
+        procbuild.arg("--qcow")
             .arg(self.output_dir.join("img.qcow2"))
-            .args(["--load-snapshot", "boot"])
             .arg("--load-pmem")
             .arg(self.crash_image_path(crash_img_hash))
             .arg("--trace")
-            .arg(&path)
-            .args(["--trace-what", "read,hypercall"])
+            .arg(&path);
+
+        if let Some(dir) = &covext_dir {
+            procbuild.arg("--disk")
+                .arg(Self::covext_drive(dir));
+        } else {
+            procbuild.args(["--load-snapshot", "boot"]);
+	}
+
+        procbuild.args(["--trace-what", "read,hypercall"])
             .arg("--run")
-            .arg(cmd)
+            .arg(full_cmd)
             .arg(&self.vm_config_path)
             .stdout(self.log.try_clone()?)
-            .stderr(self.log.try_clone()?)
-            .status()?;
+            .stderr(self.log.try_clone()?);
+
+        let status = procbuild.status()?;
         if !status.success() {
             bail!("pre-failure tracing failed with status {}", status);
         }
+
+        self.finish_covext(covext_dir)?;
         Ok(path)
     }
 
@@ -398,22 +487,24 @@ impl HeuristicCrashImageGenerator {
             .join(format!("{}.txt", hash.0.to_hex()))
     }
 
-    fn run_state_extractor(&self, crash_img: &CrashImage, qcow : &std::path::Path) -> Result<(PathBuf, PathBuf, std::process::Child)> {
+    fn run_state_extractor(&self, crash_img: &CrashImage, qcow : &std::path::Path) -> Result<(PathBuf, PathBuf, std::process::Child, Option<TempDir>)> {
+        let (covext_dir, covext_cmd) = self.create_covext_cmd()?;
+
         let cmd = format!(
-            "{prefix} && {suffix} && hypercall success",
+            "{prefix} && {suffix} && hypercall success; {covext}",
             prefix = self
                 .vm_config
                 .commands
                 .get("dump_cmd_prefix")
                 .ok_or_else(|| anyhow!("missing dump_cmd_prefix in VM configuration"))?,
-            suffix = self.test_config.dump_cmd_suffix
+            suffix = self.test_config.dump_cmd_suffix,
+            covext = covext_cmd
         );
         let cmd_output_path = self.crash_image_state_path(&crash_img.hash, "state.txt");
         let trace_path = self.crash_image_state_path(&crash_img.hash, "trace.bin");
-        let child = trace_command()?
-            .arg("--qcow")
+        let mut procbuild  = trace_command()?;
+        procbuild.arg("--qcow")
             .arg(qcow)
-            .args(["--load-snapshot", "boot"])
             .arg("--load-pmem")
             .arg(self.crash_image_path(&crash_img.hash))
             .arg("--trace")
@@ -422,12 +513,21 @@ impl HeuristicCrashImageGenerator {
             .arg("--run")
             .arg(cmd)
             .arg("--cmd-output")
-            .arg(&cmd_output_path)
-            .arg(&self.vm_config_path)
+            .arg(&cmd_output_path);
+
+
+        if let Some(dir) = &covext_dir  {
+            procbuild.arg("--disk")
+                .arg(Self::covext_drive(&dir));
+        } else {
+            procbuild.args(["--load-snapshot", "boot"]);
+	}
+
+        let child = procbuild.arg(&self.vm_config_path)
             .stdout(self.log.try_clone()?)
             .stderr(self.log.try_clone()?)
             .spawn()?;
-        return Ok((cmd_output_path, trace_path, child));
+        return Ok((cmd_output_path, trace_path, child, covext_dir));
     }
 
     fn insert_crash_image(
@@ -673,10 +773,18 @@ impl HeuristicCrashImageGenerator {
                 || checkpoint_range.as_ref().unwrap().contains(&checkpoint_id)
         };
 
+        let mut orig_img = None;
+        let orig_str;
+        if self.pmem_file().is_some() {
+            orig_str = self.pmem_file().clone().unwrap();
+            orig_img = Some(File::open(&orig_str)?);
+        }
+
         // unwrap: PMEM size will always fit in u64/usize
-        let image = MemoryImageMmap::new_in(
+        let image = MemoryImageMmap::new_from_orig(
             &self.output_dir,
             self.vm_config.vm.pmem_len.try_into().unwrap(),
+            orig_img,
         )?;
         let mem = X86PersistentMemory::new(image, LineGranularity::Cacheline)?;
         let mut replayer = MemoryReplayer::new(mem);
@@ -746,28 +854,34 @@ impl HeuristicCrashImageGenerator {
     }
 
     /// Extract the semantic state of each crash image.
-    pub fn extract_semantic_states(&mut self) -> Result<()> {
-        let pool = ThreadPool::new(32); // TODO determine this value somehow
+    pub async fn extract_semantic_states(&mut self, pool : &ThreadPool, poolguard : &Arc<Semaphore>) -> Result<()> {
         let (tx, rx) = channel();
 
         let mut states = HashMap::new();
         for (image_hash, image) in &self.crash_images {
             let tx = tx.clone();
             let tmpimg = create_tmp_image(self.output_dir.join("img.qcow2"))?;
+            let localguard = poolguard.clone();
+            let permit = localguard.acquire_owned().await.unwrap();
             let handle = self.run_state_extractor(image, tmpimg.path());
             let tmp = image_hash.clone();
-            pool.execute(move|| {
-              let state : Result<SemanticState> = finish_state_extractor(handle, tmpimg);
 
-              tx.send((tmp, state)).expect("failed!");
+            pool.spawn_ok(async move {
+              let out : Result<(SemanticState,Option<TempDir>)> = finish_state_extractor(handle, tmpimg);
+
+              tx.send((tmp, out)).expect("failed!");
+              drop(permit);
             });
         }
 
-        for (image_hash, state) in rx.iter().take(self.crash_images.len()) {
-              let real_state = state?;
+        for (image_hash, out) in rx.iter().take(self.crash_images.len()) {
+              let (state, covext) = out?;
+
+              self.finish_covext(covext)?;
+
               states
-                .entry(real_state.hash)
-                .or_insert(real_state)
+                .entry(state.hash)
+                .or_insert(state)
                 .originating_images
                 .push(image_hash);
        }
@@ -786,6 +900,17 @@ impl HeuristicCrashImageGenerator {
         self.semantic_states = states;
         Ok(())
     }
+
+    pub fn merge_cov_files(&self) -> Result<()> {
+      match &self.cov_dir {
+        None => Ok(()),
+        Some(dir) => {
+          merge_cov(dir, &self.output_dir.join("gcov"))?;
+
+          Ok(())
+        }
+      }
+    }
 }
 
 fn create_tmp_image(from : PathBuf) -> Result<tempfile::NamedTempFile> {
@@ -794,8 +919,8 @@ fn create_tmp_image(from : PathBuf) -> Result<tempfile::NamedTempFile> {
   return Ok(to);
 }
 
-fn finish_state_extractor(data : Result<(PathBuf, PathBuf, std::process::Child)>, tmpimg : tempfile::NamedTempFile) -> Result<SemanticState> {
-    let (cmd_output_path, trace_path, mut child) = data?;
+fn finish_state_extractor(data : Result<(PathBuf, PathBuf, std::process::Child, Option<TempDir>)>, tmpimg : tempfile::NamedTempFile) -> Result<(SemanticState, Option<TempDir>)> {
+    let (cmd_output_path, trace_path, mut child, covext) = data?;
 
     let status = child.wait()?;
     tmpimg.close()?;
@@ -817,10 +942,46 @@ fn finish_state_extractor(data : Result<(PathBuf, PathBuf, std::process::Child)>
             _ => {}
         }
     }
-    Ok(SemanticState {
+    Ok((SemanticState {
         hash: SemanticStateHash(hasher.finalize()),
         successful,
         // note: creating an empty Vec does not allocate
         originating_images: Vec::new(),
-    })
+    }, covext))
+}
+
+pub fn cmd_cpy(from : &Path, to : &Path) -> Result<()> {
+  if !Command::new("cp")
+     .arg("-T")
+     .arg("-r")
+     .arg(from)
+     .arg(to)
+     .status()?
+     .success() {
+     bail!("Failed to move file!");
+  }
+
+  Ok(())
+}
+
+pub fn merge_cov(dest : &Path, other : &Path) -> Result<()> {
+  if dest.read_dir().unwrap().next().is_none() {
+    cmd_cpy(other, dest)?;
+
+    return Ok(());
+  }
+
+  let status = Command::new(GCOV_TOOL)
+    .arg("merge")
+    .arg("-o")
+    .arg(dest)
+    .arg(other)
+    .arg(dest)
+    .status()?;
+
+  if !status.success() {
+    bail!("gcov-tool failed: {}\n", status);
+  }
+  // merge gcna files in dest with other via gcov-tool
+  Ok(())
 }
