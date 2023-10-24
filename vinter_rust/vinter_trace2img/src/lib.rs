@@ -7,6 +7,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 
+use threadpool::ThreadPool;
+
+use std::sync::mpsc::channel;
+
 use anyhow::{anyhow, bail, Context, Result};
 use itertools::Itertools;
 use serde::{Serialize, Serializer};
@@ -394,7 +398,7 @@ impl HeuristicCrashImageGenerator {
             .join(format!("{}.txt", hash.0.to_hex()))
     }
 
-    fn run_state_extractor(&self, crash_img: &CrashImage) -> Result<SemanticState> {
+    fn run_state_extractor(&self, crash_img: &CrashImage, qcow : &std::path::Path) -> Result<(PathBuf, PathBuf, std::process::Child)> {
         let cmd = format!(
             "{prefix} && {suffix} && hypercall success",
             prefix = self
@@ -406,9 +410,9 @@ impl HeuristicCrashImageGenerator {
         );
         let cmd_output_path = self.crash_image_state_path(&crash_img.hash, "state.txt");
         let trace_path = self.crash_image_state_path(&crash_img.hash, "trace.bin");
-        let status = trace_command()?
+        let child = trace_command()?
             .arg("--qcow")
-            .arg(self.output_dir.join("img.qcow2"))
+            .arg(qcow)
             .args(["--load-snapshot", "boot"])
             .arg("--load-pmem")
             .arg(self.crash_image_path(&crash_img.hash))
@@ -422,30 +426,8 @@ impl HeuristicCrashImageGenerator {
             .arg(&self.vm_config_path)
             .stdout(self.log.try_clone()?)
             .stderr(self.log.try_clone()?)
-            .status()?;
-        if !status.success() {
-            bail!("semantic state extraction failed with status {}", status);
-        }
-        let mut hasher = blake3::Hasher::new();
-        std::io::copy(&mut File::open(&cmd_output_path)?, &mut hasher)
-            .context("could not read semantic state output file")?;
-        let mut successful = false;
-        for entry in trace::parse_trace_file_bin(BufReader::new(
-            File::open(&trace_path).context("could not open trace output file")?,
-        )) {
-            match entry? {
-                TraceEntry::Hypercall { action, .. } if action == "success" => {
-                    successful = true;
-                }
-                _ => {}
-            }
-        }
-        Ok(SemanticState {
-            hash: SemanticStateHash(hasher.finalize()),
-            successful,
-            // note: creating an empty Vec does not allocate
-            originating_images: Vec::new(),
-        })
+            .spawn()?;
+        return Ok((cmd_output_path, trace_path, child));
     }
 
     fn insert_crash_image(
@@ -765,15 +747,30 @@ impl HeuristicCrashImageGenerator {
 
     /// Extract the semantic state of each crash image.
     pub fn extract_semantic_states(&mut self) -> Result<()> {
+        let pool = ThreadPool::new(32); // TODO determine this value somehow
+        let (tx, rx) = channel();
+
         let mut states = HashMap::new();
         for (image_hash, image) in &self.crash_images {
-            let state = self.run_state_extractor(image)?;
-            states
-                .entry(state.hash)
-                .or_insert(state)
-                .originating_images
-                .push(*image_hash);
+            let tx = tx.clone();
+            let tmpimg = create_tmp_image(self.output_dir.join("img.qcow2"))?;
+            let handle = self.run_state_extractor(image, tmpimg.path());
+            let tmp = image_hash.clone();
+            pool.execute(move|| {
+              let state : Result<SemanticState> = finish_state_extractor(handle, tmpimg);
+
+              tx.send((tmp, state)).expect("failed!");
+            });
         }
+
+        for (image_hash, state) in rx.iter().take(self.crash_images.len()) {
+              let real_state = state?;
+              states
+                .entry(real_state.hash)
+                .or_insert(real_state)
+                .originating_images
+                .push(image_hash);
+       }
 
         // copy unique semantic states
         for (state_hash, state) in &states {
@@ -789,4 +786,41 @@ impl HeuristicCrashImageGenerator {
         self.semantic_states = states;
         Ok(())
     }
+}
+
+fn create_tmp_image(from : PathBuf) -> Result<tempfile::NamedTempFile> {
+  let to = tempfile::NamedTempFile::new()?;
+  std::fs::copy(from, &to)?;
+  return Ok(to);
+}
+
+fn finish_state_extractor(data : Result<(PathBuf, PathBuf, std::process::Child)>, tmpimg : tempfile::NamedTempFile) -> Result<SemanticState> {
+    let (cmd_output_path, trace_path, mut child) = data?;
+
+    let status = child.wait()?;
+    tmpimg.close()?;
+
+    if !status.success() {
+        bail!("semantic state extraction failed with status {}", status);
+    }
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut File::open(&cmd_output_path)?, &mut hasher)
+        .context("could not read semantic state output file")?;
+    let mut successful = false;
+    for entry in trace::parse_trace_file_bin(BufReader::new(
+        File::open(&trace_path).context("could not open trace output file")?,
+    )) {
+        match entry? {
+            TraceEntry::Hypercall { action, .. } if action == "success" => {
+                successful = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(SemanticState {
+        hash: SemanticStateHash(hasher.finalize()),
+        successful,
+        // note: creating an empty Vec does not allocate
+        originating_images: Vec::new(),
+    })
 }
