@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -87,15 +88,18 @@ fn main() -> Result<()> {
                 output_dir.unwrap_or(PathBuf::from(".")),
             )?;
             println!("Tracing command...");
+            let t1 = Instant::now();
             gen.trace_pre_failure()
                 .context("pre-failure tracing failed")?;
             println!("Pre-failure trace finished. Replaying trace...");
+            let t2 = Instant::now();
             let fences_with_writes = gen.replay().context("replay failed")?;
             println!(
                 "Replay finished. {} fences with writes, {} crash images",
                 fences_with_writes,
                 gen.crash_images.len()
             );
+            let t3 = Instant::now();
             println!("Extracting semantic states...");
             gen.extract_semantic_states()
                 .context("semantic state extraction failed")?;
@@ -103,6 +107,12 @@ fn main() -> Result<()> {
                 "State extraction finished. {} unique states",
                 gen.semantic_states.len()
             );
+            let t4 = Instant::now();
+            let d1 = t2.duration_since(t1).as_millis();
+            let d2 = t3.duration_since(t2).as_millis();
+            let d3 = t4.duration_since(t3).as_millis();
+
+            println!("benchout: {} {} {} {}", d1, d2, d3, gen.crash_images.len());
         }
     }
     Ok(())
