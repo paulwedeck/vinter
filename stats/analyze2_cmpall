@@ -1,0 +1,54 @@
+#!/usr/bin/java --source 17 -ea
+
+import java.util.*;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+import java.io.IOException;
+import java.util.function.BiConsumer;
+
+class Main {
+	static Map<String, Double> test1 = new HashMap<>();
+	static Set<String> tests = new HashSet<>();
+
+	static void readFile(Path file, BiConsumer<String, Double> cons) throws IOException {
+		boolean first = true;
+		for(String line : Files.readAllLines(file)) {
+			if(!first) {
+				String[] split = line.split(" ");
+				cons.accept(split[0], Double.parseDouble(split[1]));
+			}
+			first = false;
+		}
+	}
+
+	static void overwrite(Path path, String content) throws IOException {
+		if(!content.endsWith("\n")) {
+			content = content + "\n";
+		}
+
+		Files.writeString(path, content, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
+	}
+
+
+	public static void main(String[] args) throws IOException {
+		if(args.length != 3) {
+			System.out.println("usage: <file1> <file2> <out>");
+			return;
+		}
+
+		Path file1 = Path.of(args[0]);
+		Path file2 = Path.of(args[1]);
+		Path fileout = Path.of(args[2]);
+
+		StringBuilder out = new StringBuilder();
+
+		readFile(file1, (n, v) -> test1.put(n, v));
+		
+		readFile(file2, (n, v) -> out.append(n).append(" ").append(test1.get(n)/v).append(" ").append(test1.get(n)).append('\n'));
+
+		overwrite(fileout, out.toString());
+	}
+}

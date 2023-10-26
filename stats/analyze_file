@@ -1,0 +1,55 @@
+#!/usr/bin/java --source 17 -ea
+
+import java.util.List;
+import java.util.ArrayList;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+import java.io.IOException;
+
+class Main {
+	static double listavg(List<Double> list) {
+		int size = list.size();
+
+		return list.stream().mapToDouble(d -> d/size).sum();
+	}
+
+	static double liststddev(List<Double> list) {
+		double avg = listavg(list);
+		int size = list.size();
+
+		return Math.sqrt(list.stream().mapToDouble(d -> d-avg).map(d -> d*d/size).sum());
+	}
+
+	static String analyzeFile(Path path) throws IOException {
+		List<Double> runtime = new ArrayList<>();
+
+		for(String line : Files.readAllLines(path)) {
+			String[] split = line.split(" ");
+			runtime.add(Double.parseDouble(split[1]));
+		}
+
+		double avg = listavg(runtime);
+		double stddev = liststddev(runtime);
+
+		return String.format("%1s: avg=%2f stddev=%3f\n", path, avg, stddev);
+	}
+
+	public static void main(String[] args) throws IOException {
+		if(args.length < 2) {
+			System.out.println("usage: <out> <in...>");
+			return;
+		}
+
+		String out = "";
+
+		for(int i = 1; i < args.length; i++) {
+			out += analyzeFile(Path.of(args[i]));
+		}
+
+		Path outfile = Path.of(args[0]);
+		Files.writeString(outfile, out, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
+	}
+}

@@ -1,0 +1,14 @@
+#!/usr/bin/gnuplot -c
+
+set term pdf
+set grid
+set output "./comb_bars.pdf"
+
+set boxwidth 0.9 relative
+set style data histograms
+set style histogram cluster
+set xtics rotate by -45
+
+set style fill solid 1.0 border lt -1
+
+plot './res10/bars.txt' using ($2+$3+$4):xticlabels(1) t 'Sum', './res11/bars.txt' using ($2+$3+$4) t 'Sum 2'

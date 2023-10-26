@@ -1,0 +1,18 @@
+#!/usr/bin/gnuplot -c
+
+set term pdf
+set output "./comb_bars2.pdf"
+
+set style data histograms
+set style fill solid 1 border lt -1
+set style histogram rowstacked gap 1
+set boxwidth 1 relative
+set xtics rotate by -45
+set ylabel "Average Time per Phase [Seconds]"
+set tics scale 0
+set grid noxtics ytics
+
+plot newhistogram "baseline" lt 4,"./res10/bars.txt" using 2:xticlabels(1) t "Trace Phase", "" using 3:xticlabels(1) t "Image Generation Phase", \
+    "" using 4:xticlabels(1) t "State Extraction Phase", \
+    newhistogram "opt1" lt 4, "./res11/bars.txt" using 2 notitle, "" using 3 notitle, \
+    "" using 4 notitle,

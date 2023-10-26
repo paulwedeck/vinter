@@ -1,0 +1,352 @@
+#!/usr/bin/java --source 17 -ea
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.Collections;
+
+import java.util.stream.Collectors;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+import java.io.IOException;
+
+class Main {
+	static Map<String, List<Double>> realTimes = new HashMap<>();
+	static Map<String, List<Double>> cpuTimes = new HashMap<>();
+	static List<Double> allReal = new ArrayList<>();
+	static List<Double> allCpu = new ArrayList<>();
+	static Map<String,List<Double>> crashStates = new HashMap<>();
+	static SortedSet<String> tests = new TreeSet<>();
+
+	static void readFile(Path file) {
+		try {
+			for(String line : Files.readAllLines(file)) {
+				String[] split = line.split(" ");
+				assert split.length >= 4 && split.length <= 5;
+				String name = split[0];
+
+				double[] nbrs = new double[3];
+				for(int i = 0; i < 3; i++) {
+					nbrs[i] = Double.parseDouble(split[1+i]);
+				}
+
+				if(!tests.contains(name)) {
+					realTimes.put(name, new ArrayList<>());
+					cpuTimes.put(name, new ArrayList<>());
+					crashStates.put(name, new ArrayList<>());
+					tests.add(name);
+				}
+
+				if(split.length == 5) {
+					crashStates.get(name).add(Double.parseDouble(split[4]));
+				}
+
+				realTimes.get(name).add(nbrs[0]);
+				cpuTimes.get(name).add(nbrs[1]+nbrs[2]);
+				allReal.add(nbrs[0]);
+				allCpu.add(nbrs[1]+nbrs[2]);
+			}
+		} catch(IOException ex) {
+			throw new Error(ex);
+		}
+	}
+
+	static double listavg(List<Double> list) {
+		double size = list.size();
+
+		return list.stream().mapToDouble(d -> d/size).sum();
+	}
+
+	static double listvar(List<Double> list) {
+		double avg = listavg(list);
+		double size = list.size();
+
+		return list.stream()
+			.mapToDouble(d -> d)
+			.map(d -> d - avg)
+			.map(d -> (d*d)/(size-1))
+			.sum();
+	}
+
+	static double liststddev(List<Double> list) {
+		return Math.sqrt(listvar(list));
+	}
+
+	static double listsqrsum(List<Double> list) {
+		return list.stream().mapToDouble(d -> d*d).sum();
+	}
+
+	static double listsum(List<Double> list) {
+		return list.stream().mapToDouble(d -> d).sum();
+	}
+
+	static double dotprod(List<Double> l1, List<Double> l2) {
+		double sum = 0;
+		for(int i = 0; i < l1.size(); i++) {
+			sum += l1.get(i)*l2.get(i);
+		}
+		return sum;
+	}
+
+	static String analyzeTest(String test) {
+		List<Double> real = realTimes.get(test);
+		List<Double> cpu = cpuTimes.get(test);
+
+		double realavg = listavg(real);
+		double realstddev = liststddev(real);
+		double cpuavg = listavg(cpu);
+		double cpustddev = liststddev(cpu);
+
+		return test + " " + realavg + " " + realstddev + " " + (realstddev/realavg) + " " + cpuavg + " " + cpustddev;
+	}
+
+	static void overwrite(Path path, String content) throws IOException {
+		if(!content.endsWith("\n")) {
+			content = content + "\n";
+		}
+
+		Files.writeString(path, content, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
+	}
+
+	static void normalize(String test, Path file) throws IOException {
+		List<Double> real;
+		if(test != null) {
+			real  = realTimes.get(test);
+		} else {
+			real = realTimes.values().stream().reduce(List.of(), Main::listSum);
+		}
+
+		double avg = listavg(real);
+		String normalized = real.stream()
+					.map(d -> d/avg)
+					.map(Object::toString)
+					.collect(Collectors.joining("\n"));
+		overwrite(file, normalized);
+	}
+
+	static Regression gencrashplot(Path outfile, String test) throws IOException {
+		List<Double> states;
+		List<Double> real;
+
+		states = crashStates.get(test);
+		real = realTimes.get(test);
+
+		double statesavg = listavg(states);
+		double statesstddev = liststddev(states);
+		double realavg = listavg(real);
+		double realstddev = liststddev(real);
+
+		List<Double> nstates = states.stream().map(d -> (d-statesavg)/statesstddev).collect(Collectors.toList());
+		List<Double> nreal = real.stream().map(d -> (d-realavg)/realstddev).collect(Collectors.toList());
+
+		String content = "";
+		int count = nstates.size();
+		for(int i = 0; i < count; i++) {
+			content += nreal.get(i) + " " + nstates.get(i) + "\n";
+		}
+
+		overwrite(outfile, content);
+
+		return new Regression(nstates, nreal);
+	}
+
+	static void plotcrash(Path outdir) throws IOException, InterruptedException {
+		Path outfile = outdir.resolve("crashplot.pdf");
+		Path temp = Files.createTempFile(Path.of("/tmp"), null, null);
+
+		String preamble = String.format("""
+		set term pdf size 6in, 3.5in
+		set output \"%1s\"
+		set key outside tmargin center top maxrows 5
+		set xlabel \"Normalized Crash State count\"
+		set ylabel \"Normalized Real Time\"
+		""", outfile.toString());
+
+		String content = preamble + "plot ";
+
+		for(String test : tests) {
+			if(!crashStates.get(test).isEmpty()) {
+				Path testoutfile = outdir.resolve(test + ".crash.normal");
+				Regression regr = gencrashplot(testoutfile, test);
+				String escaped_test = test.replaceAll("_", "-");
+
+				content += String.format("\"%1s\" using 1:2 with points ps 0.4 title \"%2s data points\", %3f*x+(%4f) title \"%5s regression\",", testoutfile, escaped_test, regr.beta, regr.capture, escaped_test);
+			}
+		}
+
+		overwrite(temp, content);
+
+		Runtime.getRuntime().exec(new String[] {"gnuplot", "-c", temp.toString()}).waitFor();
+
+		Files.delete(temp);
+	}
+
+	static void plotnormalize(Path outdir) throws IOException, InterruptedException {
+		Path outfile = outdir.resolve("normalplot.pdf");
+
+		Path temp = Files.createTempFile(Path.of("/tmp"), null, null);
+		String preamble = String.format("""
+		set term pdf size 6.5in, 3.5in
+		set key outside tmargin center top maxrows 7
+		set output \"%1s\"
+		set yrange [0:%2d]
+		set xrange[0:]
+		set xlabel \"Real Time Divided By Average Real Time Per Test\"
+		set ylabel \"Test Index\"
+		""", outfile.toString(), tests.size()+2);
+
+		String script = preamble + "plot ";
+		int i = tests.size()+1;
+		List<String> files = new ArrayList<>(tests);
+		files.add("sum");
+
+		for(String test : files) {
+			Path datafile = outdir.resolve(test + ".normal");
+
+			String escaped_test = test.replaceAll("_", "-");
+/*			if(escaped_test.equals("sum")) {
+				escaped_test = "all";
+			}*/
+
+			script += String.format("\"%1s\" using 1:(%2d) with points ps 0.25 pt 7 title \"%3s (%4d)\",", datafile.toString(), i, escaped_test, i);
+			i--;
+		}
+
+		overwrite(temp, script);
+
+
+		Runtime.getRuntime().exec(new String[] {"gnuplot", "-c", temp.toString()}).waitFor();
+
+		Files.delete(temp);
+	}
+
+	static void corrCrash(String test, Path output) throws IOException {
+		List<Double> states = crashStates.get(test);
+		List<Double> real = realTimes.get(test);
+
+		Regression runtime = new Regression(states, real);
+		overwrite(output, runtime.niceStr());
+	}
+
+	static List<Double> listSum(List<Double> a, List<Double> b) {
+		assert a.size() <= b.size();
+
+		int size = b.size();
+		int asize = a.size();
+
+		List<Double> sum = new ArrayList<>();
+		for(int i = 0; i < size; i++) {
+			if(i >= asize) {
+				sum.add(b.get(i));
+			} else {
+				sum.add(a.get(i) + b.get(i));
+			}
+		}
+
+		return sum;
+	}
+
+	static void calcGlobalSum(Path outdir) throws IOException {
+		List<Double> realSum = realTimes.values().stream().reduce(List.of(), Main::listSum);
+		List<Double> cpuSum = cpuTimes.values().stream().reduce(List.of(), Main::listSum);
+
+		double rsavg = listavg(realSum);
+		double rsstddev = liststddev(realSum);
+		double cpuavg = listavg(cpuSum);
+		double cpustddev = liststddev(cpuSum);
+
+		Path sumfile = outdir.resolve("sumstat");
+
+		String sumstat = String.format("realAvgSum=%1f, realSumStddev=%2f, CPUAvgSum=%3f, CPUSumStddev=%4f\n", rsavg, rsstddev, cpuavg, cpustddev);
+
+		overwrite(sumfile, sumstat);
+	}
+
+
+	public static void main(String[] args) throws IOException, InterruptedException {
+		if(args.length != 2) {
+			System.out.println("usage: <indir> <outdir>");
+			return;
+		}
+
+		Path indir = Path.of(args[0]);
+		Path outdir = Path.of(args[1]);
+		Files.createDirectories(outdir);
+
+		Files.walk(indir)
+			.filter(Files::isRegularFile)
+			.forEach(Main::readFile);
+
+		for(String test : tests) {
+			if(!crashStates.get(test).isEmpty()) {
+				corrCrash(test, outdir.resolve(test + ".crash"));
+			}
+		}
+		plotcrash(outdir);
+
+
+		for(String test : tests) {
+			normalize(test, outdir.resolve(test + ".normal"));
+		}
+		normalize(null, outdir.resolve("sum.normal"));
+
+		plotnormalize(outdir);
+
+		String table = tests.stream().map(Main::analyzeTest).collect(Collectors.joining("\n"));
+		String header = "Name AvgReal SDRealTime RelSDReal AvgCPU SDCPU";
+		Path tablefile = outdir.resolve("summary");
+		overwrite(tablefile, header + "\n" + table);
+
+
+		Regression runtime = new Regression(allReal, allCpu);
+		Path threadreg = outdir.resolve("threadcor");
+		overwrite(threadreg, runtime.niceStr());
+
+		calcGlobalSum(outdir);
+	}
+
+	static class Regression {
+		double beta;
+		double capture;
+		double rsqr;
+		double corr;
+
+		Regression(List<Double> x, List<Double> y) {
+			double yavg = listavg(y);
+			double xavg = listavg(x);
+			double xstddev = liststddev(x);
+			double ystddev = liststddev(y);
+			int size = x.size();
+
+			beta = (dotprod(x, y)/listsum(x) - yavg) / (listsqrsum(x)/listsum(x) - xavg);
+			capture = (listsum(y) - listsum(x) * beta) / size;
+
+			double sqe = x.stream().mapToDouble(this::predict).map(d -> d-yavg).map(d -> d*d).sum();
+			double sqt = y.stream().mapToDouble(d -> d-yavg).map(d -> d*d).sum();
+
+			rsqr = sqe/sqt;
+
+			corr = 0;
+			for(int i = 0; i < size; i++) {
+				double xstd = (x.get(i) - xavg) / xstddev;
+				double ystd = (y.get(i) - yavg) / ystddev;
+
+				corr += xstd*ystd/size;
+			}
+		}
+
+		String niceStr() {
+			return String.format("y=%1f * x + %2f\nR^2=%3f\ncorr=%4f", beta, capture, rsqr, corr);
+		}
+
+		double predict(double x) {
+			return beta*x+capture;
+		}
+	}
+}

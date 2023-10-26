@@ -1,0 +1,14 @@
+#!/usr/bin/gnuplot -c
+
+set term pdf
+set grid
+set output "./panda_output.pdf"
+#set key left
+set xlabel "File Size (Null Bytes) [Bytes]"
+set ylabel "VM Execution Time [Seconds]"
+
+set logscale 
+#set xrange[-1:200000000]
+
+plot "../results/test18" using 1:2 with dots title "Without Compression", \
+     "../results/test20" using 1:2 with dots title "With Compression",

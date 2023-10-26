@@ -1,0 +1,409 @@
+#!/usr/bin/java --source 17 -ea
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.Collections;
+import java.util.Comparator;
+
+import java.util.stream.Collectors;
+import java.util.function.Function;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+import java.io.IOException;
+
+class Main {
+	static SortedSet<String> tests = new TreeSet<>();
+	static Map<String, Test> data = new HashMap<>();
+	static Test alltests = new Test();
+
+	static void readFile(Path path) {
+		try {
+			for(String line : Files.readAllLines(path)) {
+				String[] split = line.split(" ");
+
+				if(!tests.contains(split[0])) {
+					tests.add(split[0]);
+					data.put(split[0], new Test());
+				}
+
+				Test test = data.get(split[0]);
+				test.parse(split);
+				alltests.parse(split);
+			}
+		} catch(IOException ex) {
+			throw new Error(ex);
+		}
+	}
+
+	static void plotList(Path outdir, String suffix, String xlabel) throws IOException, InterruptedException {
+		Path outfile = outdir.resolve(suffix + "plot.pdf");
+
+		Path temp = Files.createTempFile(Path.of("/tmp"), null, null);
+		String preamble = String.format("""
+		set term pdf
+		set grid
+		unset key
+		set output \"%1s\"
+		set yrange [0:%2d]
+		set xlabel \"%3s\"
+		set ylabel \"Test Index\"
+		""", outfile, tests.size()+1, xlabel);
+
+		String script = preamble + "plot ";
+		int i = tests.size();
+
+		for(String test : tests) {
+			Path datafile = outdir.resolve(test + "." + suffix);
+
+			String escaped_test = test.replaceAll("_", "-");
+
+			script += String.format("\"%1s\" using 1:(%2d) with points ps 0.25 pt 7 title \"%3s (%4d)\",", datafile.toString(), i, escaped_test, i);
+			i--;
+		}
+
+		overwrite(temp, script);
+
+
+		Runtime.getRuntime().exec(new String[] {"gnuplot", "-c", temp.toString()}).waitFor();
+
+		Files.delete(temp);
+	}
+
+	static String calcBarData(String test) {
+		Test testData = data.get(test);
+		String escaped_test = test.replaceAll("_", "-");
+
+		double avgTrace = listavg(testData.trace);
+		double avgGen = listavg(testData.gen);
+		double avgExtract = listavg(testData.extract);
+
+		return String.format("%1s %2f %3f %4f", escaped_test, avgTrace, avgGen, avgExtract);
+	}
+
+	static void plotBars(Path outdir) throws IOException, InterruptedException {
+		Path outfile = outdir.resolve("bars.pdf");
+		Path datafile = outdir.resolve("bars.txt");
+		Path temp = Files.createTempFile(Path.of("/tmp"), null, null);
+
+		String data = tests.stream()
+			.sorted(Comparator.reverseOrder())
+			.map(Main::calcBarData)
+			.collect(Collectors.joining("\n"));
+
+		overwrite(datafile, data);
+
+		String script = String.format("""
+		set term pdf
+		set grid noxtics ytics
+		set output \"%1s\"
+
+		set style data histograms
+		set style fill solid 1 border lt -1
+		set style histogram rowstacked gap 1
+		set boxwidth 1 relative
+		set xtics rotate by -45
+		set ylabel "Average Time per Phase [s]"
+
+		plot '%2s' using 2 t "Trace Phase" lt 4, '' using 3:xticlabels(1) t "Image Generation Phase" lt 5, '' using 4:xticlabels(1) t "State Extraction Phase" lt 6,
+
+		""", outfile, datafile);
+
+		overwrite(temp, script);
+
+		Runtime.getRuntime().exec(new String[] {"gnuplot", "-c", temp.toString()}).waitFor();
+
+		Files.delete(temp);
+	}
+
+	static void plotcombcorr(Path outdir, String suffix, String xlabel, String ylabel, Regression globalregr) throws IOException, InterruptedException {
+		Path outfile = outdir.resolve("combined." + suffix + ".pdf");
+		Path temp = Files.createTempFile(Path.of("/tmp"), null, null);
+
+		String preamble = String.format("""
+		set term pdf
+		set grid
+		set output \"%1s\"
+		set xlabel \"%2s\"
+		set ylabel \"%3s\"
+		""", outfile, xlabel, ylabel);
+
+		String content = preamble + "plot ";
+
+		for(String test : tests) {
+			if("all".equals(test)) {
+				continue;
+			}
+
+			String escaped_test = test.replaceAll("_", "-");
+
+			Path corrfile = outdir.resolve(test + "." + suffix);
+
+			content += String.format("\"%1s\" using 1:2 with points ps 0.25 notitle,", corrfile, escaped_test);
+			// title \"%2s data points\"
+		}
+
+
+		if(globalregr != null) {
+			content += String.format("%1f*x+(%2f) title \"%3s\"", globalregr.beta, globalregr.capture, globalregr.regrStr());
+		}
+
+		overwrite(temp, content);
+
+		Runtime.getRuntime().exec(new String[] {"gnuplot", "-c", temp.toString()}).waitFor();
+
+		Files.delete(temp);
+	}
+
+
+	public static void main(String[] args) throws IOException, InterruptedException {
+		if(args.length != 2) {
+			System.out.println("usage: <indir> <outdir>");
+			return;
+		}
+
+		Path indir = Path.of(args[0]);
+		Path outdir = Path.of(args[1]);
+		Files.createDirectories(outdir);
+
+		Files.walk(indir)
+			.filter(Files::isRegularFile)
+			.forEach(Main::readFile);
+
+		tests.add("all");
+		data.put("all", alltests);
+
+		tests.parallelStream().forEach(test -> data.get(test).paraanalyze(outdir, test));
+
+		plotList(outdir, "trace", "Trace Time [s]");
+		plotList(outdir, "gen", "Generation Time [s]");
+
+		plotcombcorr(outdir, "corr_trace_sum", "Trace Time [s]", "Sum [s]", new Regression(alltests.trace, alltests.sum));
+		plotcombcorr(outdir, "corr_gen_sum", "Image Generation Time [s]", "Sum [s]", new Regression(alltests.gen, alltests.sum));
+		plotcombcorr(outdir, "corr_extract_sum", "State Extraction Time [s]", "Sum [s]", new Regression(alltests.extract, alltests.sum));
+		plotcombcorr(outdir, "corr_states_extract", "Crash State Count", "State Extraction Time [s]", new Regression(alltests.states, alltests.extract));
+
+		printSummary(t -> t.trace, outdir.resolve("trace_summary"), "TraceTime");
+		printSummary(t -> t.gen, outdir.resolve("gen_summary"), "StateGenerationTime");
+		printSummary(t -> t.extract, outdir.resolve("extract_summary"), "StateExtractionTime");
+
+		plotBars(outdir);
+	}
+
+	static void printSummary(Function<Test, List<Double>> transform, Path file, String name) throws IOException {
+		String table = tests.parallelStream().map(test -> {
+			double val_listavg = listavg(transform.apply(data.get(test)));
+			double sum_avg = listavg(data.get(test).sum);
+
+			return test + " " + val_listavg + " " + (val_listavg/sum_avg);
+			})
+			.collect(Collectors.joining("\n"));
+		overwrite(file, "Test " + name + " Relative\n" + table);
+	}
+
+	static double listavg(List<Double> list) {
+		double size = list.size();
+
+		return list.stream().mapToDouble(d -> d/size).sum();
+	}
+
+	static double listvar(List<Double> list) {
+		double avg = listavg(list);
+		double size = list.size();
+
+		return list.stream()
+			.mapToDouble(d -> d)
+			.map(d -> d - avg)
+			.map(d -> (d*d)/(size-1))
+			.sum();
+	}
+
+	static double liststddev(List<Double> list) {
+		return Math.sqrt(listvar(list));
+	}
+
+	static double listsqrsum(List<Double> list) {
+		return list.stream().mapToDouble(d -> d*d).sum();
+	}
+
+	static double listsum(List<Double> list) {
+		return list.stream().mapToDouble(d -> d).sum();
+	}
+
+	static double dotprod(List<Double> l1, List<Double> l2) {
+		double sum = 0;
+		for(int i = 0; i < l1.size(); i++) {
+			sum += l1.get(i)*l2.get(i);
+		}
+		return sum;
+	}
+
+	static void overwrite(Path path, String content) throws IOException {
+		if(!content.endsWith("\n")) {
+			content = content + "\n";
+		}
+
+		Files.writeString(path, content, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
+	}
+
+	static class Test {
+		List<Double> trace = new ArrayList<>();
+		List<Double> gen = new ArrayList<>();
+		List<Double> extract = new ArrayList<>();
+		List<Double> states = new ArrayList<>();
+		List<Double> sum = new ArrayList<>();
+
+		void parse(String[] split) {
+			List<List<Double>> lists = List.of(trace, gen, extract, states);
+
+			for(int i = 0; i < 4; i++) {
+				double add = Double.parseDouble(split[1+i]);
+
+				if(i <= 3) {
+					add /= 1000;
+				}
+
+				lists.get(i).add(add);
+			}
+			sum.add(lists.stream().mapToDouble(l -> l.get(l.size()-1)).sum());
+		}
+
+		void plotcorr(Path outdir, String name, String suffix, String xlabel, String ylabel, List<Double> first, List<Double> second) throws IOException, InterruptedException {
+			Path corrfile = outdir.resolve(name + "." + suffix);
+			String corrcontent = "";
+			for(int i = 0; i < first.size(); i++) {
+				corrcontent += first.get(i) + " " + second.get(i) + "\n";
+			}
+			overwrite(corrfile, corrcontent);
+
+			Path outfile = outdir.resolve(name + "." + suffix + ".pdf");
+			Path temp = Files.createTempFile(Path.of("/tmp"), null, null);
+
+			String preamble = String.format("""
+			set term pdf
+			set grid
+			set output \"%1s\"
+			set xlabel \"%2s\"
+			set ylabel \"%3s\"
+			""", outfile, xlabel, ylabel);
+
+			String content = preamble + "plot ";
+
+			Regression regr = new Regression(first, second);
+			overwrite(outdir.resolve(name + "." + suffix + ".regr"), regr.niceStr());
+			String escaped_test = name.replaceAll("_", "-");
+			if(escaped_test.equals("all")) {
+				escaped_test = "";
+			}
+
+			content += String.format("\"%1s\" using 1:2 with points ps 0.4 title \"%2s data points\", %3f*x+(%4f) title \"%5s %6s\",", corrfile, escaped_test, regr.beta, regr.capture, escaped_test, regr.regrStr());
+
+			overwrite(temp, content);
+
+			Runtime.getRuntime().exec(new String[] {"gnuplot", "-c", temp.toString()}).waitFor();
+
+			Files.delete(temp);
+		}
+
+		void printfrac(Path outdir, String name) throws IOException {
+			List<Double> tfrac = new ArrayList<>();
+			List<Double> gfrac = new ArrayList<>();
+			List<Double> efrac = new ArrayList<>();
+			for(int i = 0; i < sum.size(); i++) {
+				double lsum = sum.get(i);
+
+                tfrac.add(trace.get(i)/lsum);
+                gfrac.add(gen.get(i)/lsum);
+                efrac.add(extract.get(i)/lsum);
+			}
+
+			double avgt = listavg(tfrac);
+			double avgg = listavg(gfrac);
+			double avge = listavg(efrac);
+
+			double stddevt = liststddev(tfrac);
+			double stddevg = liststddev(gfrac);
+			double stddeve = liststddev(efrac);
+
+			String out = String.format("avgtrace=%1f, stddevtrace=%2f, avggen=%3f, stddevgen=%4f, avgextract=%5f, stddevextract=%6f\n", avgt, stddevt, avgg, stddevg, avge, stddeve);
+
+			overwrite(outdir.resolve(name + ".frac"), out);
+		}
+
+		void outputList(Path outdir, List<Double> data, String name) throws IOException {
+			Path file = outdir.resolve(name);
+			String content = data.stream().map(Object::toString).collect(Collectors.joining("\n"));
+			overwrite(file, content);
+
+		}
+
+		void paraanalyze(Path outdir, String name) {
+			try {
+				analyze(outdir, name);
+			} catch(Throwable thrown) {
+				throw new Error(thrown);
+			}
+		}
+
+		void analyze(Path outdir, String name) throws IOException, InterruptedException {
+			outputList(outdir, trace, name + ".trace");
+			outputList(outdir, gen, name + ".gen");
+
+			plotcorr(outdir, name, "corr_trace_sum", "Trace Time [s]", "Sum [s]", trace, sum);
+			plotcorr(outdir, name, "corr_gen_sum", "Image Generation Time [s]", "Sum [s]", gen, sum);
+			plotcorr(outdir, name, "corr_extract_sum", "State Extraction Time [s]", "Sum [s]", extract, sum);
+			plotcorr(outdir, name, "corr_states_extract", "Crash State Count [s]", "State Extraction Time [s]", states, extract);
+
+			printfrac(outdir, name);
+		}
+	}
+
+	static class Regression {
+		double beta;
+		double capture;
+		double rsqr;
+		double corr;
+
+		Regression(List<Double> x, List<Double> y) {
+			double yavg = listavg(y);
+			double xavg = listavg(x);
+			double xstddev = liststddev(x);
+			double ystddev = liststddev(y);
+			int size = x.size();
+
+			beta = (dotprod(x, y)/listsum(x) - yavg) / (listsqrsum(x)/listsum(x) - xavg);
+			capture = (listsum(y) - listsum(x) * beta) / size;
+
+			double sqe = x.stream().mapToDouble(this::predict).map(d -> d-yavg).map(d -> d*d).sum();
+			double sqt = y.stream().mapToDouble(d -> d-yavg).map(d -> d*d).sum();
+
+			rsqr = sqe/sqt;
+
+			corr = 0;
+			for(int i = 0; i < size; i++) {
+				double xstd = (x.get(i) - xavg) / xstddev;
+				double ystd = (y.get(i) - yavg) / ystddev;
+
+				corr += xstd*ystd/size;
+			}
+		}
+
+		String niceStr() {
+			return String.format("y=%1f * x + %2f\nR^2=%3f\ncorr=%4f", beta, capture, rsqr, corr);
+		}
+
+		String regrStr() {
+			return String.format("regression y=%1.2f * x + %2.2f (corr=%3f)", beta, capture, corr);
+		}
+
+		double predict(double x) {
+			return beta*x+capture;
+		}
+	}
+}

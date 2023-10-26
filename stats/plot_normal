@@ -1,0 +1,6 @@
+#!/usr/bin/gnuplot -c 
+
+set term svg
+set output ARG1.".svg"
+
+plot ARG1 using 1:(0)

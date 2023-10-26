@@ -1,0 +1,15 @@
+- Test 1: All tests sequentially for vinter\_pre (20 iterations)
+- Test 3: All tests in parallel for vinter\_pre (5 iterations; 32 threads)
+- Test 4: All tests sequentially for vinter\_opt1 (5 iterations)
+- Test 5: All tests in parallel for vinter\_opt1 (5 iterations; 32 threads)
+- Test 6: All tests in parallel (single instance) for vinter\_opt2 (5 iterations; 32 threads)
+- Test 7: All tests in parallel (single instance) for vinter\_opt2 (5 iterations; 40 threads)
+- Test 8: Selected tests (update-middle, rename-long-name, touch-long-name, hello-world) sequentially for vinter\_pre (20 iterations)
+- Test 9: Test 8 for vinter\_opt1 (20 iterations)
+- Test 10: All tests sequentially with execution time per phase for vinter\_pre\_mod1 (15 iterations)
+- Test 11: Test 10 for vinter\_opt1\_mod1 (15 iterations)
+- Test 12: Startup time of the Vinter VM without snapshots (using vinter\_pre; 20 iterations)
+- Test 14: fs-dump time for vinter\_final for various file sizes
+- Test 17: Startup time of the Vinter VM using snapshots (using vinter\_pre; 20 iterations)
+- Test 18: fs-dump time for vinter\_pre for various file sizes
+- Test 20: fs-dump time for vinter\_final for various file sizes
